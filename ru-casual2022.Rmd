@@ -1,0 +1,629 @@
+---
+title: "Twilight for tenure: even more data exploration"
+date: 2022-05-31
+categories:
+  - work
+output:
+    hugormd::post:
+        highlight_shortcode: false
+        transparent_plots: false
+---
+
+```{r setup, include=F, cache=F}
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(glue)
+library(patchwork)
+opts_chunk$set(echo=F, cache=T, message=F, use_shortcode=T)
+```
+
+
+```{r utils}
+pct <- function (x, accuracy=0.1) {
+    scales::percent(x, accuracy=accuracy,
+                    suffix= if (knitr::is_latex_output()) "\\%" else "%")
+}
+
+big <- scales::label_comma()
+ay <- \(x) str_c(x, "–", x + 1) # converts year to academic year, for labels
+
+boilerplate <- " IPEDS data; figure by Andrew Goldstone (andrewgoldstone.com)."
+```
+
+```{r unitids}
+unitid_ru <- c(nb = 186380, nwk = 186399, cmd = 186371)
+unitid_runb <- 186380
+```
+
+```{r ipeds-utils, file="ipeds.R"}
+```
+
+```{r download}
+data_dir <- "ipeds"
+if (!dir.exists(data_dir)) {
+    message("Creating data directory ", data_dir)
+    dir.create(data_dir)
+}
+
+years <- 2013:2020
+latest_year <- max(years)
+
+# institution characteristics: we'll just use the most recent
+
+hd_file <- get_ipeds("HD", latest_year, "")
+
+# Employees by Assigned Position: the big HR data file
+
+eap_files <- get_ipeds("EAP", years, "")
+
+# HD codebook as Excel file
+hd_dict_file <- get_ipeds_zip(file.path(data_dir, "HD2020_DICT.zip"))
+
+# (EAP codebook could similarly be obtained with:)
+# eap_dict_file <- get_ipeds_zip(file.path(data_dir, "EAP2020_DICT.zip"))
+```
+
+
+```{r load, message=F, warning=F}
+load_series <- function (fs) tibble(filename=fs) %>%
+    mutate(year=as.numeric(str_extract(filename, "\\d{4}"))) %>%
+    mutate(frm=map(filename, read_csv)) %>%
+    unnest(frm)
+
+hd <- read_csv(hd_file)
+eap <- load_series(eap_files)
+
+hd_dict <- read_excel(hd_dict_file, sheet=4)
+# don't need EAP dictionary since I'll do the recoding by hand; if needed load with:
+# eap_dict <- read_excel(eap_dict_file, sheet=4)
+```
+
+```{r eap_fac}
+eap_vars <- c(
+    "EAPFTTYP", "EAPPTTYP",
+    "EAPFTMED", "EAPPTMED"
+)
+
+# recode and pivot eap to long form (dropping the all-in "all staff" category);
+# further notes on OCCUPCAT/FACSTAT codes in eap-notes.Rmd. 
+eap_fac <- eap %>%
+    mutate(across(c(OCCUPCAT, FACSTAT), as.character)) %>%
+    filter(OCCUPCAT %in% c(
+            211, # Instructional staff, primarily instruction
+            215, # Instructional staff - Instruction/research/public service
+            220, # Research
+            230, # Public service
+            250, # Librarians/Library Technicians/Archivists and Curators, and Museum technicians/Student and Academic Affairs and Other Education Services
+            10 * (30:39), # 300-series is management and non-academic functions
+            10 * (40:49)    # 400-series is grads:
+                            # 400 Graduate Assistants Total          
+                            # 410 Graduate Assistants Teaching       
+                            # 420 Graduate Assistants Research       
+                            # ... pre-2017 other grad types
+                            # 490 Graduate Assistants  other
+            )) %>%
+    mutate(OCCUPCAT=fct_collapse(OCCUPCAT,
+        "300"=as.character(10 * (30:39)), # collapse 300-series
+        "490"=as.character(10 * (43:49)) # collapse old grad-other categories
+            )) %>% 
+    filter(FACSTAT %in% c(
+            0,   # All staff
+            20,  # With faculty status, tenured
+            30,  # With faculty status, on tenure track
+            40,  # With faculty status not on tenure track/No tenure system, total
+            50   # Without faculty status
+          )) %>% 
+    select(year, UNITID, OCCUPCAT, FACSTAT, all_of(eap_vars)) %>%
+    mutate(
+        across(all_of(eap_vars), ~replace_na(.x, 0)) # perhaps aggressive?
+    ) %>%
+    pivot_longer(all_of(eap_vars),
+                 names_to=c("ft", "typ"),
+                 names_pattern="EAP(FT|PT)(TYP|MED)",
+                 values_to="count")
+```
+
+```{r hd_types}
+# some extra coding of institutions based on Carnegie classifications
+hd_types <- hd %>%
+    mutate(superclass=case_when(
+        C18BASIC %in% 1:14 ~ "Associate's/Two-Year", 
+        C18BASIC %in% 15:17 ~ "Doctoral Universities", 
+        C18BASIC %in% 18:20 ~ "Master's Universities", 
+        C18BASIC %in% 21:23 ~ "Baccalaureate Colleges",
+        C18BASIC %in% 24:32 ~ "Special Focus Four-Year",
+        C18BASIC == 33 ~ "Tribal Colleges",
+        TRUE ~ NA_character_ # "not in carnegie universe
+        )
+    )
+```
+
+```{r fac_types}
+# academic worker categories: includes all instructional staff, all research staff,
+# all public service staff, teaching and research grads, and librarians/archivists/ed 
+# services; excludes management and "other" grads. Within these, we create a four-fold # typology of staffing types. We keep staff designated "without faculty status" as
+# some institutions (notably NYU) put a large number of contingent instructors in this # category.
+
+fac_types <- eap_fac %>%
+     # strip mgmt and other grads
+    filter(!OCCUPCAT %in% c(300, 490)) %>%
+    # strip "all staff" and "all grads" codes
+    filter(FACSTAT != 0 | OCCUPCAT %in% c(410, 420)) %>%
+    mutate(staff_category=case_when(
+        FACSTAT %in% c(20, 30) ~ "T/TT", # both FT and (rare) PT T/TT
+        FACSTAT %in% c(40, 50) & ft == "FT" ~ "NTT",
+        FACSTAT %in% c(40, 50) & ft == "PT" ~ "PT",
+        OCCUPCAT %in% c(410, 420) ~ "grad",
+        TRUE ~ NA_character_ # should be an error
+        )) %>%
+    mutate(instructional=OCCUPCAT %in% c(211, 215, 410),
+           research=OCCUPCAT %in% c(215, 220, 420),
+           faculty=FACSTAT != 50)
+
+# verify 
+if (any(is.na(fac_types$staff_category)))
+    stop("fac_types$staff_category contains an illegitimate NA")
+
+# our analysis is going to be confined to Title IV degree-granting institutions
+# so let's store those and join on the metadata we use
+
+fac_pset <- fac_types %>%
+    inner_join(
+        hd_types %>% filter(PSET4FLG == 1) %>% # Title IV universities only
+           select(UNITID, CONTROL, C18BASIC, INSTNM, superclass)
+    )
+```
+
+
+
+In my [last post on casualization at Rutgers](https://andrewgoldstone.com/blog/ru-casual2021/), written November 2021, I discussed statistics on the rise of full-time, non-tenure-track faculty, arguing that this was an increasingly significant yet under-discussed aspect of the broader erosion of the tenure track. I promised then that I'd follow up on some of the details about different categories of faculty and of institutions. Would my dire picture of "twilight for tenure" change if I separated non-medical from medical faculty, or if I paid attention to faculty with non-instructional roles? Well, I'm pleased to report the picture is dire no matter how you paint it.  I've been looking at the more granular information on higher-education staffing found in the Human Resources data from the Department of Education (specifically, the "Employees by Assigned Position" or EAP data files from [IPEDS](https://nces.ed.gov/ipeds/use-the-data)). Here are some tentative explorations, vacillating between being tediously technical and speculatively broad-brush. Skip to the end for my regular "workers of the world" conclusion followed by faculty-casualization league tables for research universities.
+
+The basic question is, what are the terms of employment for people doing academic work in higher education? The EAP data answer that question by classifying workers at each institution as tenured, tenure-track, non-tenure-track, or "without faculty status,"  dividing each category into full-time and part-time categories _and_ according to whether they are in medical schools or not. The EAP survey also subdivides academic workers' duties into instruction, research, and public service---as well as further categories like librarianship, archiving, and "Student and Academic Affairs." Graduate workers ("graduate assistants") are treated as another employee category, assigned either to teaching or research (and medical or non-).
+That leaves us with many possible ways of cross-cutting or subsetting the data about tenured and contingent academic work. (Obviously such categories do not exhaust the interesting variables; for example, the EAP data does not include any demographic information about each category. These are found in other IPEDS components, which however do not subdivide job categories with the same granularity.)
+What I want to do here is explore---without being exhaustive about it---whether the divisions matter to our understanding of contingency in the academy. I'm hoping that even if my analysis is wanting, the [annotated R code on github](https://github.com/agoldst/ru-casual2022), as "tidy" as I can make it, might help others get a leg up on working with this data.
+
+<!--more-->
+
+Discussions of contingent work in higher education usually focus on the teaching function. For example, the [most recent AAUP report on the economic status of the profession](https://www.aaup.org/report/annual-report-economic-status-profession-2020-21) restricts its analysis to non-medical instructional faculty. This restriction makes sense for many purposes. It focuses attention on who is doing the work of teaching in higher education---which, after all, is the fundamental purpose of the whole system---and it underlines the impact of the decline of tenure on the college classroom. Leaving out medical faculty is also reasonable in this context. Adjunct medical faculty are often well-compensated clinicians who neither need nor want full-time or tenured faculty status, though the case for protecting the academic freedom of medical faculty is probably pretty much the same as for any other specialist faculty. It is just that the picture is distorted by the ragingly unequal political economy of American health care.^[Medicine is not the only field with a ragingly unequal political economy, of course.]
+
+Nationally, across all of American higher education, most teachers
+(`r fac_pset %>%
+    filter(instructional, year == 2020) %>%
+    mutate(ttt=staff_category == "T/TT") %>%
+    group_by(ttt) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=scales::percent(count / sum(count), 0.1)) %>%
+    filter(!ttt) %>%
+    pull(frac)
+`)
+are not on the tenure track: they are part-time (PT) non-tenured instructors, full-time non-tenure-track (NTT) faculty, or graduate TAs.^[
+The analysis here is everywhere restricted to IPEDS data for Title IV degree-granting institutions.]
+The most numerous category of all is part-time instructional staff, who outnumber tenure and tenure-track (T/TT)  faculty on their own.[^nyu]
+But these overall numbers conceal a great deal of variation. For example, tenure essentially does not exist in for-profit higher-education; at for-profits, faculty are overwhelmingly part-time 
+(`r fac_pset %>%
+    filter(instructional, year == 2020) %>%
+    filter(CONTROL == 3) %>%
+    group_by(staff_category) %>%
+    summarize(count = sum(count)) %>%
+    mutate(frac=scales::percent(count / sum(count), 0.1)) %>%
+    filter(staff_category == "PT") %>%
+    pull(frac)
+    `).
+The proportion of PT faculty in in non-profits is half that figure, but they are still the most numerous group. On the other hand, among _medical_ faculty, full-time non-tenure-track instructors are much more common; in fact they are the majority. The proportions of tenure-track faculty are comparable between medical and non-medical faculties, but the composition of the contingent majority is rather different. Here are the breakdowns as of 2020–2021, where I have given percentages of _all_ instructors in order to give a sense of the relative size of the groups in question.
+
+```{r nyu_tx}
+nyu_tx <- eap_fac %>%
+    filter(UNITID == 193900, year %in% 2015:2016) %>%
+    filter(FACSTAT %in% c(40, 50), ft == "PT", OCCUPCAT %in% c(211, 215, 220, 230)) %>%
+    group_by(year, FACSTAT) %>%
+    summarize(count=sum(count))
+```
+
+[^nyu]: "Instructional staff" rather than faculty, because the EAP data record many university employees assigned to "primarily instruction" or to "instruction, research, and public service" as "without faculty status." It [seems to be](https://surveys.nces.ed.gov/ipeds/public/glossary) up to individual institutions to decide who has this status and what it means, but I don't see any reason not to count instructors as faculty even if their institutions don't call them "faculty." NYU seems to have redesignated all of its part-time faculty as part-time non-faculty in 2017; for 2015–2016 NYU reported
+`r nyu_tx %>% filter(year == 2015, FACSTAT == 40) %>% pull(count)` non-tenure-track part-time _faculty_ in instruction, research, and/or public service; for 2016–2017 it reported `r nyu_tx %>% filter(year == 2016, FACSTAT == 40) %>% pull(count)`, but `r nyu_tx %>% filter(year == 2016, FACSTAT == 50) %>% pull(count)` part-time staff _without_ faculty status in the same category, and it has followed the same practice in subsequent years. I must say that Anno Trumpii I was an interesting year to recategorize exploited workers. The NYU adjunct union, UAW Local 7902---of which I was briefly a member, in 2011–2012---appears to have been in contract negotiations from [2016 to 2018](https://actuaw.org/uploads/1/2/3/6/123643831/nyu-7902-contract-2016-2022.pdf), but I don't see any hints that NYU was attempting to move part-time faculty out of the bargaining unit.
+
+    Nonetheless, this particular case motivates me to include part-time employees "without faculty status" in my reckoning of contingent faculty. Below, when I write "part-time faculty," I mean part-time employees assigned to instruction, research, and/or public service, whether designated non-tenure-track faculty or without faculty status; and the same goes for "full-time NTT" with respect to faculty status.
+
+
+```{r for_profits_table}
+fac_pset %>%
+    filter(instructional, year == 2020) %>%
+    mutate(type=case_when(
+        CONTROL == 3 ~ "in for-profits",
+        typ == "TYP" ~ "in non-profits: non-medical",
+        typ == "MED" ~ "in non-profits: medical",
+        TRUE ~ "other" # should be empty
+    )) %>%
+    group_by(type, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    ungroup() %>% # so percentages are of grand total
+    mutate(frac_total=count / sum(count)) %>%
+    mutate(fracs=str_c(pct(frac_total), "<br>(", pct(frac), ")")) %>%
+    select("instructional staff"=type, staff_category, fracs) %>%
+    pivot_wider(names_from="staff_category", values_from="fracs") %>%
+    knitr::kable(escape=F, caption=
+"Proportion of instructional staff across all title-IV postsecondary institutions. Numbers in parentheses are the proportions within the table row. 
+Source: IPEDS 2020–2021."
+    )
+```
+
+### More about full-time NTTs
+
+Now let us return to the rise of the full-time non-tenure-track faculty. The 
+pictures in my previous post, it turns out,  owe some of their drama to the inclusion of medical faculty. Among non-medical instructional faculty, NTTs have a smaller share of the total, but they remain the only staffing category which has been consistently growing in recent years, in relative and absolute terms.^[I start the series in 2013–2014. The date is chosen partly for parochial reasons: Rutgers merged with UMDNJ, creating a large medical school, in 2013. But I also didn't want to face the additional data-wrangling chores created by changes in the IPEDS data made at the same time. At least for now.] (Click on any of the figures for the full-size version.)
+
+`<a href="figure/instr_trends_plot-1.png">`{=html}
+```{r instr_trends_plot, fig.width=7, fig.height=5}
+instr_trends <- fac_pset %>%
+    filter(CONTROL %in% 1:2) %>%
+    filter(instructional, typ == "TYP") %>%
+    group_by(year, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    mutate(staff_category=fct_reorder2(staff_category, year, count))
+
+instr_trends %>%
+    ggplot(aes(year, frac, color=staff_category, group=staff_category)) +
+        geom_line() +
+        scale_x_continuous(name="academic year",
+                           labels = ay) +
+        scale_y_continuous(name="% instructional staff",
+                           limits=c(0, 0.5),
+                           labels=pct) + 
+        scale_color_discrete(name="staff type") +
+        theme_classic() +
+        labs(caption=str_wrap(str_c(
+"Proportion of non-medical instructional staff at non-profit colleges and universities.", boilerplate)))
+```
+`</a>`{=html}
+
+`<a href="figure/instr_trends_count_plot-1.png">`{=html}
+```{r instr_trends_count_plot, fig.width=7, fig.height=5}
+instr_trends %>%
+    ggplot(aes(year, count, fill=staff_category, group=staff_category)) +
+    geom_col() + facet_wrap(~ staff_category, nrow=1) +
+    scale_x_continuous(name="academic year",
+                       labels = ay) +
+    scale_y_continuous(name="total instructors (1000s)",
+                       labels=\(x) round(x / 1000)) +
+    scale_color_discrete(name="staff type") +
+    theme_classic() +
+    theme(legend.position="bottom",
+          strip.background=element_blank(),
+          panel.grid=element_blank(),
+          axis.text.x=element_text(angle=90, vjust=0.5)) +
+    labs(caption=str_wrap(str_c(
+        "Total numbers of non-medical instructional staff at non-profit colleges and universities.", boilerplate)))
+
+```
+`</a>`{=html}
+
+The late-breaking uptick in the proportion of T/TT faculty in 2020–2021 is an effect of a shrinking denominator, as part-time numbers were greatly reduced in the first pandemic year; the absolute number of T/TT faculty also decreased, but only slightly, from 2019–2020 to 2020–2021. One could not want a clearer demonstration of the difference true job security makes than the ease with which tens of thousands of adjuncts were shown the door in the midst of a global crisis.
+
+Focusing on non-medical instructional faculty, not only are the majority contingent (NTT, part-time, or TAs), but contingent faculty are the majority within most higher-education institutions. However, it turns out there are plenty of institutions (about 15% overall) where there is a T/TT majority of instructional staff, especially among four-year colleges. But even in this category, institutions with at least 75% T/TT instructors are quite rare.
+
+```{r superclass-tt-table}
+fac_pset %>%
+    filter(CONTROL %in% 1:2, C18BASIC != -2, year == latest_year) %>%
+    filter(typ == "TYP", instructional) %>%
+    group_by(UNITID, staff_category) %>%
+    summarize(count=sum(count), superclass=unique(superclass)) %>%
+    filter(any(count > 0)) %>% # eliminate 13 UNITIDs with empty staffs
+    mutate(frac=count / sum(count)) %>%
+    select(-count) %>%
+    pivot_wider(names_from=staff_category, values_from=frac, values_fill=0) %>%
+    select(superclass, `T/TT`) %>%
+    group_by(superclass) %>%
+    mutate(tt_frac=cut(`T/TT`, breaks=(0:4) / 4,
+        include.lowest=T,
+        labels=c("< 25% T/TT", "25-50%", "50-75%", "> 75% T/TT"))) %>%
+    count(tt_frac) %>%
+    ungroup() %>%
+    pivot_wider(names_from=tt_frac, values_from=n, values_fill=0) %>%
+    bind_rows(tibble(superclass="Total", summarize(., across(!superclass, sum)))) %>%
+    rowwise() %>%
+    mutate(Total=sum(c_across(!superclass))) %>%
+    rename(Type=superclass) %>%
+    knitr::kable(caption=
+                 "Degree-granting non-profit institutions, by class and % T/TT instructional staff. Source: IPEDS 2020–2021."
+    )
+```
+
+```{r no_tt}
+no_tt <- fac_pset %>%
+    filter(CONTROL %in% 1:2, typ == "TYP") %>%
+    filter(instructional) %>%
+    group_by(year, UNITID, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    pivot_wider(names_from=staff_category, values_from=count, values_fill=0) %>%
+    filter(grad > 0 | NTT > 0 | PT > 0) %>%
+    group_by(year) %>%
+    summarize(nott=sum(`T/TT` == 0),
+              tt=sum(`T/TT` != 0),
+              frac=pct(mean(`T/TT` == 0)),
+              n=n())
+```
+
+Bear in mind, however, that there are almost as many instructional staff (including graduate TAs) at the "Doctoral Universities" as there are at all other institution types combined.  Also not evident from the table is the astonishing number of institutions with no tenure track at all, who are here grouped in with those institutions with low but non-zero rates of T/TT instruction. In 2013–14
+`r no_tt %>% filter(year == 2013) %>% pull(nott)` out of 
+`r no_tt %>% filter(year == 2013) %>% pull(n)`
+(`r no_tt %>% filter(year == 2013) %>% pull(frac)`)
+non-profit institutions
+had no T/TT faculty; in 2020–2021 the figure was
+`r no_tt %>% filter(year == 2020) %>% pull(nott)` out of 
+`r no_tt %>% filter(year == 2020) %>% pull(n)`
+(`r no_tt %>% filter(year == 2020) %>% pull(frac)`).^[Among other things, it appears that basically all new colleges and universities lack tenure systems.]
+
+### What about researchers?
+
+But teaching is not the whole story in higher education: what about research? In the EAP dataset, one finds large groups of faculty---and graduate assistants---classified under "research" alone. I noticed this when looking more carefully at Rutgers's own staffing pattern; at Rutgers, about a third 
+(`r fac_pset %>%
+    filter(UNITID %in% unitid_ru, year == latest_year) %>%
+    filter(typ == "TYP", staff_category == "NTT") %>%
+    mutate(rni=research & !instructional) %>%
+    group_by(year, staff_category, rni) %>%
+    summarize(count=sum(count)) %>%
+    mutate(total=sum(count)) %>%
+    filter(rni) %>%
+    transmute(l=str_c(count, " out of ", total)) %>%
+    pull(l)
+    `)
+of the full-time NTT faculty are reported as assigned to research and _not_ to instruction; only a very few T/TT faculty have the same classification. On the flagship New Brunswick campus, if we count all faculty  assigned to any combination of instruction or research or public service, there are nearly as many non-medical NTTs as there are non-medical T/TT faculty. This by no means the case nationally, even at research universities, but trends in different faculty categories are interesting to compare to the picture of instructional staff above.
+
+
+`<a href="figure/non_medical_trends-1.png">`{=html}
+```{r non_medical_trends, fig.width=10.5, fig.height=7.5}
+fac_typ <- fac_pset %>%
+    filter(CONTROL %in% 1:2) %>%
+    filter(typ == "TYP") %>%
+    filter(OCCUPCAT %in% c(211, 215, 220, 230, 250, 410, 420)) %>%
+    # discard non-fac librarians
+    filter(OCCUPCAT != 250 | FACSTAT %in% c(20, 30, 40)) %>%
+    mutate(staff_category=fct_relevel(staff_category, "PT", "T/TT", "NTT", "grad"))
+
+typ_research <- fac_typ %>%
+    filter(research) %>%
+    group_by(year, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count))
+
+typ_all <- fac_typ %>%
+    group_by(year, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count))
+
+bind_rows("non-medical research"=typ_research, "all non-medical"=typ_all,
+          .id="assignment") %>%
+    mutate(assignment=fct_relevel(assignment, "non-medical research")) %>%
+    ggplot(aes(year, frac, color=staff_category, group=staff_category)) +
+        geom_line() +
+        facet_wrap(~ assignment) +
+        scale_x_continuous(name="academic year",
+                           labels = ay) +
+        scale_y_continuous(name="% faculty/grads",
+                           limits=c(0, 0.4),
+                           labels=pct) + 
+        scale_color_discrete(name="staff type") +
+        theme_classic() +
+        theme(legend.position="bottom",
+              strip.background=element_blank(),
+              panel.grid=element_blank(),
+              axis.text.x=element_text(angle=90, vjust=0.5)) +
+        theme(legend.position="bottom") +
+        labs(caption=str_wrap(str_c(
+    "Proportions of non-medical faculty and grad workers at non-profit colleges and universities among those assigned (not necessarily exclusively) to research (left) or all assigned to any combination of research, instruction, or public service, or librarians with faculty status (right).", boilerplate)))
+```
+`</a>`{=html}
+
+With the research function in view, graduate assistants are a much larger group, but the full-time NTT category is still striking in its growth. It is not at all self-evident that the research GA is to T/TT faculty research what the TA is to T/TT faculty teaching. I imagine many of the research GAs are in large science labs at research universities, a very different situation from the humanities doctoral student doing an individual dissertation project while earning money as a TA. The same distinctions apply of course to the full-time NTT category, which (if I am not mistaken) includes the sciences' large army of postdocs. But this dataset has no information at the discipline level.
+
+The impact of contingent forms of employment on _research_ in higher education seems to me much less discussed than the impact on teaching, even though academic freedom  is just as significant to research as to teaching. Instruction is casualized because the majority of instructors are not T/TT, across the whole system and at most institutions. Research is less casualized only by comparison; T/TT faculty are in fact the plurality in the research category, but both the growth of NTTs and the enormous size of the graduate worker category mean that academic freedom in research is still not very well-protected by tenure. No less consequential, however, is the large proportion of instructional staff who are _not_ also researchers. The ideal of higher education is that it combines instruction and research, the transmission and the creation of knowledge, in the same institutions and the same personnel. But the reality is that most instructional personnel are not also assigned research duties, and the more casualized, the less likely to be employed for research:
+
+```{r non_research_instructors_table}
+fac_pset %>%
+    filter(CONTROL %in% 1:2, typ == "TYP", year == 2020) %>%
+    filter(OCCUPCAT %in% c(211, 215)) %>%
+    mutate(role=fct_recode(OCCUPCAT,
+                           "Instruction/research/public service"="215",
+                           "Primarily instruction"="211")) %>%
+    group_by(role, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    ungroup() %>%
+    mutate(frac=pct(count / sum(count))) %>%
+    select(-count) %>%
+    pivot_wider(names_from=staff_category, values_from=frac) %>%
+    select(role, `T/TT`, `NTT`, `PT`) %>%
+    arrange(desc(role)) %>%
+    knitr::kable(caption=
+                 "Proportion of all instructional staff (excluding graduate students) assigned to instruction primarily or instruction, research, and public service, across all non-profit Title IV institutions. Source: IPEDS 2020–2021.")
+```
+
+Even if you are inclined to be sanguine about the moderately less casualized staffing pattern of the research function, you should be troubled by the way casualization breaks the connection between teaching and research.
+
+Of course, justice would not be achieved by assigning all existing part-time adjuncts and NTTs to research as well as instruction. As things stand, it would be far better to expand tenure beyond the research function and protect academic freedom with tenure systems for _all_ faculty appropriate to their existing duties: teaching tenure, research tenure, and so on. But it must be said that making it possible for more higher-education teachers to be teacher-researchers is also an important project, which would be at best only indirectly advanced by campaigning for job security for all.
+
+### Rutgers: always casual Friday
+
+I started down this rabbit-hole in an attempt to better understand the situation at my own institution. Rutgers has a large medical faculty and a large group of faculty and grads who are assigned to research and not instruction. On campus, these individuals matter a great deal. How much does counting or omitting them, separately or together, affect the overall casualization ratios, at Rutgers and at its broad peer group of "Very High Research Activity" research universities (a.k.a R1 universities)? Here is a lot of stuff on a chart:
+
+`<a href="figure/fac_r1_plot-1.png">`{=html}
+```{r fac_r1_plot, fig.width=10, fig.height=10}
+fac_r1 <- fac_pset %>%
+    filter(CONTROL %in% 1:2, C18BASIC == 15) %>%
+    mutate(UNITID=case_when(
+        UNITID %in% unitid_ru ~ unitid_runb, # lump Rutgers
+        # Penn State Main Campus UNITID remapped to all-PSU UNITID created in 2020
+        UNITID == 214777 ~ 495767,
+        TRUE ~ UNITID
+    ))
+
+fac_r1_plot <- function (x, label) x %>%
+    group_by(year, UNITID, staff_category) %>%
+    summarize(count=sum(count), CONTROL=unique(CONTROL)) %>%
+    mutate(frac=count / sum(count)) %>%
+    mutate(runb=case_when(
+        UNITID == unitid_runb ~ "Rutgers",
+        CONTROL == 1 ~ "Public R1",
+        CONTROL == 2 ~ "Private R1",
+        TRUE ~ "other" # should be error
+        )) %>%
+    ggplot(aes(year, frac)) +
+        geom_line(aes(group=UNITID, color=runb, alpha=runb)) +
+        facet_wrap(~ staff_category) +
+        scale_alpha_manual(guide=guide_legend(title=NULL),
+                           values=c("Rutgers"=1,
+                                    "Public R1"=0.1,
+                                    "Private R1"=0.1)) +
+        scale_color_manual(guide=guide_legend(title=NULL),
+                           values=c("Rutgers"="black",
+                                    "Public R1"="blue",
+                                    "Private R1"="orange")) +
+        theme_classic() +
+        scale_x_continuous(name="academic year",
+                           labels = ay) +
+        scale_y_continuous(name="% staff", labels=pct) + 
+        theme(legend.position="bottom",
+              strip.background=element_blank(),
+              panel.grid=element_blank(),
+              axis.text.x=element_text(angle=90, vjust=0.5)) +
+        labs(title=label)
+
+
+pr1_instr_typ <- fac_r1 %>%
+    filter(typ == "TYP", instructional) %>%
+    fac_r1_plot("Non-medical instruction")
+
+pr1_instr <- fac_r1 %>%
+    filter(instructional) %>%
+    fac_r1_plot("Medical and non-medical instruction")
+
+pr1_typ <- fac_r1 %>%
+    filter(typ == "TYP") %>%
+    fac_r1_plot("Non-medical instruction and/or research")
+
+pr1 <- fac_r1 %>%
+    fac_r1_plot("All faculty and grad assistants")
+
+# use patchwork to scrunch all these pictures together
+(
+ (pr1_instr_typ + pr1_instr) / (pr1_typ + pr1) / guide_area() +
+    plot_layout(guides = 'collect', heights=c(3, 3, 1)) +
+    plot_annotation(caption=str_wrap(glue(
+"Each line represents the proportions of academic workers in the given category at one of {n_distinct(fac_r1$UNITID)} R1 universities. Rutgers (all campuses combined) is bolded in black.{boilerplate}"
+    )))) %>%
+    print()
+```
+`</a>`{=html}
+
+The main use of this graphic is to verify that overall trends are broadly comparable with or without medical faculty and with or without the non-instructional faculty and grads. Public universities (faint blue lines) have notably larger grad populations, especially if research graduate assistants are included. The T/TT trend lines are also striking compared to the other staffing categories in their relative _lack_ of variation, both across time and across universities, around the 35% rate.[^r1var] By contrast to the long-term picture of decline, this looks a little like a short-to-medium-term equilibrium: perhaps 35% T/TT is the point at which the remaining power of the tenured rump to reproduce itself meets university administrators' desire to maintain the prestige value of having some "traditional" professors around, as long as they don't cause too much trouble. But news from  [Florida](https://www.aaup.org/news/relentless-crusade-destroy-higher-education-florida) and [Georgia](https://www.aaup.org/news/aaup-censures-university-system-georgia) shows that right-wing politicians are ready and able to disrupt any such equilibrium. The moment may soon be ripe for a red-state tenure-elimination wave which would bring many public universities down to 0% T/TT.[^doom] 
+In the meantime, advocates of tenure had better commit themselves to the slow boring of hard boards, faculty line by faculty line.
+
+
+[^r1var]: The 25th and 75th percentiles for the proportion of T/TT non-medical instructional faculty at R1s in 2020–2021 were
+`r fac_r1 %>% filter(typ == "TYP", instructional) %>%
+    group_by(year, UNITID, staff_category) %>%
+    summarize(count=sum(count), CONTROL=unique(CONTROL)) %>%
+    mutate(frac=count / sum(count)) %>%
+    filter(year == 2020, staff_category == "T/TT") %>%
+    pull(frac) %>%
+    quantile(c(0.25, 0.75)) %>%
+    pct() %>%
+    str_c(collapse=" and ")
+`. Penn is the R1 university with the remarkably high T/TT rate. But whereas there isn't much change over time, obviously there is still variation across universities in their casualization practices. I explored some possible explanations for some of this variation, but quickly reached the limits of this dataset (not to mention the limits of inference-by-inspection). Even within IPEDS, however, one could certainly go further by making use of information on, for example, institutional wealth, student-body size, and geographic location. There is no IPEDS variable for the presence of a faculty or grad union, but this is obviously another important piece of information. 
+
+[^doom]: Actually, I imagine the name "tenure" would be retained, but a new array of causes for termination would be introduced by legislation that would in effect enable termination at will. In fact when IPEDS releases its 2021–2022 data, it will be necessary to start putting asterisks next to figures that include systems like Georgia State.
+
+Dismal forebodings aside, highlighting Rutgers on the chart shows my university's exceptional reliance on part-time faculty. No matter how you slice it, Rutgers's thousands of adjuncts make Rutgers quite unusual among R1 universities. Restricting to non-medical instructional faculty where the use of PT faculty is most intense, Rutgers ranks
+`r fac_r1 %>%
+    filter(typ == "TYP", instructional, CONTROL==1) %>%
+    group_by(year, UNITID, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    filter(year == 2020, staff_category == "PT") %>%
+    ungroup() %>%
+    mutate(rk=rank(-frac)) %>%
+    filter(UNITID == unitid_runb) %>%
+    pull(rk)
+`th
+among public R1 universities and
+`r fac_r1 %>%
+    filter(typ == "TYP", instructional) %>%
+    group_by(year, UNITID, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    filter(year == 2020, staff_category == "PT") %>%
+    ungroup() %>%
+    mutate(rk=rank(-frac)) %>%
+    filter(UNITID == unitid_runb) %>%
+    pull(rk)`th
+among all R1s in its proportion of part-time instructional staff. I'll give the table of all R1s at the end of the post.
+Rutgers's high rate of adjunctification corresponds to a smaller proportion of tenured and tenure-track faculty (as well as of TAs).  At the same time, Rutgers is also clearly working on a "solution" to adjunctification in its increasing use of full-time NTTs, to the ultimate detriment of both teaching and research. Many other universities are moving along the same trajectory. If an alternate path is to be found, it will require a strategy of organizing across the distinction between research-focused and teaching-focused workers, and across the related but not identical divisions between more secure and less secure job categories as well. Locally at least, it seems to me we have not yet exhausted our capacity to fight back. But to renew tenure at the national level would require a real increase in the share of social resources invested in learning and research, taking the reins of our public institutions back from an indifferent or contemptuous ruling class and the penny-pinching privatizers who serve them as college and university managers.
+
+*R source code and instructions for reproducing the plots and numbers in this post may be found at <https://github.com/agoldst/ru-casual2022>, together with some possibly helpful notes and code about handling the IPEDS data.*
+
+### R1 universities, ranked by contingency in instruction
+
+```{r staffing_tsv}
+staffing_fine <- fac_pset %>%
+    filter(year == 2020, typ == "TYP") %>%
+    mutate(instructional=fct_recode(as_factor(instructional),
+                                    "instr"="TRUE",
+                                    "non_instr"="FALSE"),
+           crosscat=fct_cross(staff_category, instructional, sep="_")) %>%
+    group_by(UNITID, crosscat) %>%
+    summarize(count = sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    pivot_wider(names_from=crosscat, values_from=c(frac, count),
+                values_fill=0, names_sep="_")
+    
+
+staffing_coarse <- fac_pset %>%
+    filter(year == 2020, typ == "TYP") %>%
+    group_by(UNITID, staff_category) %>%
+    summarize(count = sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    pivot_wider(names_from=staff_category, values_from=c(frac, count),
+                values_fill=0, names_glue="{staff_category}_{.value}_total")
+
+inner_join(staffing_fine, staffing_coarse, by="UNITID") %>%
+    inner_join(hd %>% select(UNITID, INSTNM, CONTROL, C18BASIC), by="UNITID") %>%
+    ipeds_label("CONTROL", hd_dict) %>%
+    ipeds_label("C18BASIC", hd_dict) %>%
+    select(UNITID, INSTNM, CONTROL, C18BASIC,
+           matches("frac.*_instr"),
+           matches("count.*_instr"),
+           matches("frac.*non_instr"),
+           matches("count.*non_instr"),
+           everything()) %>%
+    write_tsv("staffing2020.tsv")
+```
+
+(For simple further exploration, I also created a [TSV file](https://github.com/agoldst/ru-casual2022/staffing2020.tsv) with these staffing category breakdowns for each Title IV university. The format is suitable for a spreadsheet program.)
+
+```{r r1_table}
+fac_r1 %>%
+    filter(typ == "TYP", instructional, year == 2020) %>%
+    group_by(UNITID, staff_category) %>%
+    summarize(count=sum(count)) %>%
+    mutate(frac=count / sum(count)) %>%
+    mutate(frac=pct(frac)) %>%
+    select(-count) %>%
+    ungroup() %>%
+    mutate(staff_category=fct_recode(staff_category, TA="grad")) %>%
+    pivot_wider(names_from=staff_category, values_from=frac, values_fill="0%") %>%
+    inner_join(hd %>% select(UNITID, INSTNM, CONTROL)) %>%
+    arrange(`T/TT`) %>%
+    mutate(INSTNM=case_when(
+        UNITID == unitid_runb ~ "<strong>Rutgers</strong> (all campuses)",
+        CONTROL == 1 ~ str_c("<strong>", INSTNM, "</strong>"),
+        TRUE ~ INSTNM)) %>%
+    select(`RU-VH University`=INSTNM, everything()) %>%
+    select(-UNITID, -CONTROL) %>%
+    knitr::kable(escape=F, caption="Types of non-medical instructional staff at R1 universities in 2020–2021, arranged by increasing proportion of T/TT faculty. Public universities in <strong>italics</strong>.")
+```
+             
+
+
+

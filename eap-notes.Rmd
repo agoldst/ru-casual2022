@@ -1,0 +1,227 @@
+```{r setup, include=F, cache=F}
+library(tidyverse)
+library(readxl)
+library(ggrepel)
+library(knitr)
+library(glue)
+library(patchwork)
+opts_chunk$set(echo=F, cache=T, message=F, use_shortcode=T)
+```
+
+```{r file="ipeds.R"}
+```
+
+```{r download}
+data_dir <- "ipeds"
+if (!dir.exists(data_dir)) {
+    message("Creating data directory ", data_dir)
+    dir.create(data_dir)
+}
+
+years <- 2013:2020
+
+eap_files <- get_ipeds("EAP", years, "")
+```
+
+```{r load}
+eap <- load_series(eap_files)
+```
+
+EAP coding is annoying because many categories are merely supercategories of others. The exception is the most general level "All staff" which sometimes is not exhausted by apparent subcategories.
+
+EAPCAT is a redundant variable:
+
+        EAPCAT = OCCUPCAT . FACSTAT[0]
+
+with the 0 padding only used for `FACSTAT = 0`. Verification:
+
+```{r}
+eap %>% mutate(FACSTAT=ifelse(FACSTAT == 0, "00", FACSTAT)) %>%
+    mutate(ck=EAPCAT == str_c(OCCUPCAT, FACSTAT)) %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+The count variables `EAP*` are also redundant:
+
+```{r}
+eap %>% summarize(ck=all(EAPTOT == EAPTYP + EAPMED, na.rm=T)) %>%
+    pull(ck)
+eap %>% summarize(ck=all(EAPFT == EAPFTTYP + EAPFTMED, na.rm=T)) %>%
+    pull(ck)
+eap %>% summarize(ck=all(EAPPT == EAPPTTYP + EAPPTMED, na.rm=T)) %>%
+    pull(ck)
+eap %>% summarize(ck=all(EAPTYP == EAPPTTYP + EAPFTTYP, na.rm=T)) %>%
+    pull(ck)
+eap %>% summarize(ck=all(EAPMED == EAPPTMED + EAPFTMED, na.rm=T)) %>%
+    pull(ck)
+```
+
+To check identities in the coding of OCCUPCAT and FACSTAT, the following function can be used
+
+```{r}
+verify_identity <- function (x, var, partcodes, totcode) {
+    x %>% filter({{ var }} %in% c(partcodes, totcode)) %>%
+        filter(any({{ var }} %in% partcodes)) %>%
+        mutate(tot=ifelse({{ var }} == {{ totcode }}, 1 , -1)) %>%
+        summarize(ck=sum(EAPTOT * tot) == 0) %>%
+        summarize(ck=all(ck))
+}
+```
+
+# OCCUPCAT identities
+
+
+        # 200 = 210 + 220 + 230
+
+Instr, research, public service: holds
+
+```{r}
+eap %>% group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, c(210, 220, 230), 200) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+        # 210 = 211 + 215
+
+Instructional staff identity: holds except for one year of the Sacramento Ultrasound Institute
+
+```{r}
+eap %>% group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, c(211, 215), 210) %>% filter(!ck)
+```
+
+        # 211 = 212 + 213 + 214
+
+Instruction cr/non-cr identity: holds
+
+```{r}
+eap %>% group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, 212:214, 211) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+        # 250 = 260 + 270
+
+Librarians, Archivists, etc:
+
+```{r}
+eap %>% group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, c(260, 270), 250) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+        # 260 = 261 + 262 + 263 + 264
+
+Librarian subcategories:
+
+```{r}
+eap %>% group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, 261:264, 260) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+        # 400 = 4[1..8]0 | up through 2015
+
+Grad subcategories. In 2013–2015, there was a more refined taxonomy of grads and the identity is
+
+```{r}
+eap %>% filter(year %in% 2013:2015) %>%
+    group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, 10 * (41:48), 400) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+After that, we have
+
+        # 400 = 410 + 420 + 490 | from 2016 on
+
+```{r}
+eap %>% filter(year >= 2016) %>%
+    group_by(year, UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, c(410, 420, 490), 400) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+# FACSTAT identities
+
+        0 = 10 + 50 + 60 | up through 2016
+        0 = 10 + 50 | unless OCCUPCAT=100
+
+
+All staff either do or do not have faculty status, you'd think. Up through 2016 there is an NA category, FACSTAT = 60 ("non-degree granting institution"), which exhausts the possibilities. But after 2016, in the "All staff" OCCUPCAT=100 category, this NA category is gone and the dichotomy does not hold.
+
+
+```{r}
+eap %>% 
+    filter(OCCUPCAT != 100) %>%
+    group_by(year, UNITID, OCCUPCAT) %>%
+    verify_identity(FACSTAT, c(10, 50), 0) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+
+        10 = 20 + 30 + 40
+
+Faculty categories.
+
+```{r}
+eap %>% 
+    group_by(year, UNITID, OCCUPCAT) %>%
+    verify_identity(FACSTAT, c(20, 30, 40), 10) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+
+        40 = 41 + 42 + 43
+
+NTT categories
+
+```{r}
+eap %>% 
+    group_by(year, UNITID, OCCUPCAT) %>%
+    verify_identity(FACSTAT, 41:43, 40) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+        41 = 44 + 45
+
+NTT multiyear and indefinite breakdown
+
+```{r}
+eap %>% 
+    group_by(year, UNITID, OCCUPCAT) %>%
+    verify_identity(FACSTAT, 44:45, 41) %>%
+    ungroup() %>%
+    summarize(ck=all(ck)) %>%
+    pull(ck)
+```
+
+        # 100 != 200 + 250 + 3[0..9]0 + 400
+
+You would think the list of staff categories is meant to be exhaustive, but it is not. This equation is only true about half the time (counting each year/UNITID/OCCUPCAT separately).
+
+```{r}
+eap %>%
+    group_by(UNITID, FACSTAT) %>%
+    verify_identity(OCCUPCAT, c(200, 250, 10 * (30:39), 400), 100) %>%
+    summarize(sum(ck), n())
+```
