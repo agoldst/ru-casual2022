@@ -600,7 +600,7 @@ inner_join(staffing_fine, staffing_coarse, by="UNITID") %>%
     write_tsv("staffing2020.tsv")
 ```
 
-(For simple further exploration, I also created a [TSV file](https://github.com/agoldst/ru-casual2022/staffing2020.tsv) with these staffing category breakdowns for each Title IV university. The format is suitable for a spreadsheet program.)
+(For simple further exploration, I also created a tab-separated values file [downloadable from Github](https://github.com/agoldst/ru-casual2022/staffing2020.tsv) with these staffing category breakdowns for each Title IV university. The format is suitable for a spreadsheet program.)
 
 ```{r r1_table}
 fac_r1 %>%
