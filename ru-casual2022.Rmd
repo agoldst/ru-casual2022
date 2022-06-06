@@ -225,6 +225,8 @@ nyu_tx <- eap_fac %>%
 
     Nonetheless, this particular case motivates me to include part-time employees "without faculty status" in my reckoning of contingent faculty. Below, when I write "part-time faculty," I mean part-time employees assigned to instruction, research, and/or public service, whether designated non-tenure-track faculty or without faculty status; and the same goes for "full-time NTT" with respect to faculty status.
 
+    *Adding this, 6/4/2022:* The low numbers of TAs reported by NYU also leap to the eye. Though NYU has thousands of graduate students, and GSOC-UAW Local 2110 says it [represents about 4000 graduate workers](https://makingabetternyu.org/understand-it/), NYU reports only a few hundred graduate assistants, most either in medical research or in the "Graduate Assistants other" category. Any other graduate students who teach at NYU must be among the part-time instructional staff "without faculty status." I'm sure NYU isn't the only university whose IPEDS data obscure the (often overlapping) roles of graduate students and adjuncts, but I don't know of any way to sort this out except case by case. In the meantime, in my tables and charts here, take any zeroes (especially) a grain of salt.
+
 
 ```{r for_profits_table}
 fac_pset %>%
