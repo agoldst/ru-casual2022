@@ -6,7 +6,7 @@ library(tidyverse)
 # take a vector of zip file names, download and extract data where not already
 # present, return a list of extracted files
 
-get_ipeds_zip <- function (fs) {
+get_ipeds_zip <- function (fs, data_dir="ipeds") {
     result <- fs
     names(result) <- fs
     for (zfile in fs) {
@@ -43,7 +43,7 @@ get_ipeds_zip <- function (fs) {
     result
 }
 
-get_ipeds <- function (prefix, years, suffix)
+get_ipeds <- function (prefix, years, suffix, data_dir="ipeds")
     get_ipeds_zip(file.path(data_dir, str_c(prefix, years, suffix, ".zip")))
 
 
